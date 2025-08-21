@@ -1,0 +1,607 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
+
+namespace StalkerPortalExample
+{
+    // Root config class
+    public class Config
+    {
+        public PortalConfig Portal { get; set; }
+        public HlsConfig Hls { get; set; }
+        public ProxyConfig Proxy { get; set; }
+
+        public void Validate()
+        {
+            var macRegex = new Regex(@"^[A-F0-9]{2}(:[A-F0-9]{2}){5}$", RegexOptions.IgnoreCase);
+            var tzRegex = new Regex(@"^[a-zA-Z]+\/[a-zA-Z_]+$");
+
+            if (string.IsNullOrEmpty(Portal.Model)) throw new Exception("Empty model");
+            if (string.IsNullOrEmpty(Portal.SerialNumber)) throw new Exception("Empty serial number");
+            if (string.IsNullOrEmpty(Portal.DeviceId)) throw new Exception("Empty device_id");
+            if (string.IsNullOrEmpty(Portal.DeviceId2)) throw new Exception("Empty device_id2");
+            if (!macRegex.IsMatch(Portal.Mac)) throw new Exception("Invalid MAC");
+            if (string.IsNullOrEmpty(Portal.Location)) throw new Exception("Empty portal URL");
+            if (!tzRegex.IsMatch(Portal.TimeZone)) throw new Exception("Invalid timezone");
+
+            if (!Hls.Enabled && !Proxy.Enabled)
+                throw new Exception("No services enabled");
+
+            if (Hls.Enabled && string.IsNullOrEmpty(Hls.Bind))
+                throw new Exception("Empty HLS bind");
+
+            if (Proxy.Enabled && string.IsNullOrEmpty(Proxy.Bind))
+                throw new Exception("Empty Proxy bind");
+
+            if (Proxy.Rewrite && !Hls.Enabled)
+                throw new Exception("HLS must be enabled for proxy rewrite");
+
+            if (string.IsNullOrEmpty(Portal.Token))
+            {
+                Portal.Token = GenerateRandomToken();
+                Console.WriteLine($"No token given, using random one: {Portal.Token}");
+            }
+        }
+
+        private string GenerateRandomToken()
+        {
+            var rng = new Random();
+            const string allowedChars = "ABCDEF0123456789";
+            var chars = new char[32];
+            for (int i = 0; i < chars.Length; i++)
+            {
+                chars[i] = allowedChars[rng.Next(allowedChars.Length)];
+            }
+            return new string(chars);
+        }
+    }
+
+    public class PortalConfig
+    {
+        public string Model { get; set; }
+        public string SerialNumber { get; set; }
+        public string DeviceId { get; set; }
+        public string DeviceId2 { get; set; }
+        public string Signature { get; set; }
+        public string Mac { get; set; }
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string Location { get; set; }
+        public string TimeZone { get; set; }
+        public string Token { get; set; }
+    }
+
+    public class HlsConfig
+    {
+        public bool Enabled { get; set; }
+        public string Bind { get; set; }
+    }
+
+    public class ProxyConfig
+    {
+        public bool Enabled { get; set; }
+        public string Bind { get; set; }
+        public bool Rewrite { get; set; }
+    }
+
+    // The Portal class with handshake, authenticate, watchdog, http request, and channel retrieval
+    public class Portal
+    {
+        private readonly PortalConfig _config;
+        private readonly HttpClient _httpClient;
+
+        public Portal(PortalConfig config)
+        {
+            _config = config;
+            _httpClient = new HttpClient();
+        }
+
+        public async Task StartAsync()
+        {
+            await HandshakeAsync();
+
+            if (!string.IsNullOrEmpty(_config.Username) && !string.IsNullOrEmpty(_config.Password))
+            {
+                await AuthenticateAsync();
+            }
+
+            await WatchdogUpdateAsync();
+
+            // Start watchdog loop (fire-and-forget)
+            _ = WatchdogLoopAsync();
+        }
+
+        private async Task HandshakeAsync()
+        {
+            var url = $"{_config.Location}?type=stb&action=handshake&prehash=0&token={_config.Token}&JsHttpRequest=1-xml";
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2116 Mobile Safari/533.3");
+            request.Headers.Add("X-User-Agent", $"Model: {_config.Model}; Link: Ethernet");
+            request.Headers.Add("Cookie", $"PHPSESSID=null; sn={_config.SerialNumber}; mac={_config.Mac}; stb_lang=en; timezone={_config.TimeZone}");
+
+            var response = await _httpClient.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+
+            var content = await response.Content.ReadAsStringAsync();
+
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("js", out var jsElement) && jsElement.TryGetProperty("Token", out var tokenElement))
+            {
+                var token = tokenElement.GetString();
+                if (!string.IsNullOrEmpty(token))
+                {
+                    _config.Token = token;
+                    Console.WriteLine($"Received new token from handshake: {_config.Token}");
+                }
+                else
+                {
+                    Console.WriteLine("Handshake accepted existing token");
+                }
+            }
+            else
+            {
+                Console.WriteLine("Handshake response missing 'js' or 'Token' field");
+            }
+        }
+
+        private async Task AuthenticateAsync()
+        {
+            var url = $"{_config.Location}?type=stb&action=do_auth&login={Uri.EscapeDataString(_config.Username)}&password={Uri.EscapeDataString(_config.Password)}&device_id={_config.DeviceId}&device_id2={_config.DeviceId2}&JsHttpRequest=1-xml";
+
+            var content = await HttpRequestAsync(url);
+
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("js", out var jsElement) && jsElement.ValueKind == JsonValueKind.True)
+            {
+                Console.WriteLine("Authentication successful.");
+                return;
+            }
+            else if (root.TryGetProperty("text", out var textElement))
+            {
+                var msg = textElement.GetString();
+                Console.WriteLine($"Authentication failed: {msg}");
+            }
+
+            throw new Exception("Invalid credentials or authentication failed");
+        }
+
+        private async Task WatchdogUpdateAsync()
+        {
+            var url = $"{_config.Location}?action=get_events&event_active_id=0&init=0&type=watchdog&cur_play_type=1&JsHttpRequest=1-xml";
+            await HttpRequestAsync(url);
+            Console.WriteLine("Watchdog update succeeded.");
+        }
+
+        private async Task WatchdogLoopAsync()
+        {
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromMinutes(2));
+                try
+                {
+                    await WatchdogUpdateAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Watchdog update error: {ex.Message}");
+                    Environment.Exit(1); // Fatal error, exit app as original Go code calls log.Fatalln
+                }
+            }
+        }
+
+        public async Task<string> HttpRequestAsync(string url)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2116 Mobile Safari/533.3");
+            request.Headers.Add("X-User-Agent", $"Model: {_config.Model}; Link: Ethernet");
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _config.Token);
+            request.Headers.Add("Cookie", $"PHPSESSID=null; sn={_config.SerialNumber}; mac={_config.Mac}; stb_lang=en; timezone={_config.TimeZone}");
+
+            var response = await _httpClient.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"Site '{url}' returned {response.StatusCode}");
+            }
+
+            return await response.Content.ReadAsStringAsync();
+        }
+
+        // Retrieve all TV channels
+        public async Task<Dictionary<string, Channel>> RetrieveChannelsAsync()
+        {
+            var url = $"{_config.Location}?type=itv&action=get_all_channels&force_ch_link_check=&JsHttpRequest=1-xml";
+            var content = await HttpRequestAsync(url);
+
+            var channelResponse = JsonSerializer.Deserialize<ChannelsResponse>(content);
+            if (channelResponse == null || channelResponse.Js?.Data == null)
+                throw new Exception("Failed to parse channels response");
+
+            var genres = await GetGenresAsync();
+
+            var channels = new Dictionary<string, Channel>();
+            foreach (var c in channelResponse.Js.Data)
+            {
+                var channel = new Channel
+                {
+                    Title = c.Name,
+                    Cmd = c.Cmd,
+                    LogoLink = c.Logo,
+                    GenreID = c.TvGenreId,
+                    Portal = this,
+                    Genres = genres,
+                    CmdChId = c.Cmds?.Count > 0 ? c.Cmds[0].Id : null,
+                    CmdId = c.Cmds?.Count > 0 ? c.Cmds[0].ChId : null
+                };
+                channels[c.Name] = channel;
+            }
+
+            return channels;
+        }
+
+        // Get genre dictionary
+        private async Task<Dictionary<string, string>> GetGenresAsync()
+        {
+            var url = $"{_config.Location}?action=get_genres&type=itv&JsHttpRequest=1-xml";
+            var content = await HttpRequestAsync(url);
+
+            var genreResponse = JsonSerializer.Deserialize<GenresResponse>(content);
+            if (genreResponse == null || genreResponse.Js == null)
+                throw new Exception("Failed to parse genres response");
+
+            var genres = new Dictionary<string, string>();
+            foreach (var g in genreResponse.Js)
+            {
+                genres[g.Id] = g.Title;
+            }
+            return genres;
+        }
+    }
+
+    // Supporting DTOs for channels JSON deserialization
+    public class ChannelsResponse
+    {
+        public ChannelsJs Js { get; set; }
+    }
+
+    public class ChannelsJs
+    {
+        public List<ChannelData> Data { get; set; }
+    }
+
+    public class ChannelData
+    {
+        public string Name { get; set; }
+        public string Cmd { get; set; }
+        public string Logo { get; set; }
+        public string TvGenreId { get; set; }
+        public List<CmdData> Cmds { get; set; }
+    }
+
+    public class CmdData
+    {
+        public string Id { get; set; }
+        public string ChId { get; set; }
+    }
+
+    public class GenresResponse
+    {
+        public List<GenreData> Js { get; set; }
+    }
+
+    public class GenreData
+    {
+        public string Id { get; set; }
+        public string Title { get; set; }
+    }
+
+    // Channel class similar to Go code
+    public class Channel
+    {
+        public string Title { get; set; }
+        public string Cmd { get; set; }
+        public string LogoLink { get; set; }
+        public Portal Portal { get; set; }
+        public string GenreID { get; set; }
+        public Dictionary<string, string> Genres { get; set; }
+        public string CmdId { get; set; }
+        public string CmdChId { get; set; }
+
+        // Retrieve a working stream link for this channel
+        public async Task<string> NewLinkAsync(bool retry = false)
+        {
+            var url = $"{Portal._config.Location}?action=create_link&type=itv&cmd={Uri.EscapeDataString(Cmd)}&JsHttpRequest=1-xml";
+            string content;
+            try
+            {
+                content = await Portal.HttpRequestAsync(url);
+            }
+            catch (Exception e)
+            {
+                if (!retry && !string.IsNullOrEmpty(Portal._config.Username) && !string.IsNullOrEmpty(Portal._config.Password))
+                {
+                    Console.WriteLine("Failed to retrieve new link. Attempting re-authentication...");
+                    try
+                    {
+                        await Portal.AuthenticateAsync();
+                        return await NewLinkAsync(true);
+                    }
+                    catch (Exception authEx)
+                    {
+                        Console.WriteLine("Reauthentication failed: " + authEx.Message);
+                        throw;
+                    }
+                }
+                throw;
+            }
+
+            using var doc = JsonDocument.Parse(content);
+            var cmdString = doc.RootElement.GetProperty("js").GetProperty("cmd").GetString();
+            var parts = cmdString.Split(' ');
+            return parts[^1]; // last part
+        }
+
+        public string Logo()
+        {
+            if (string.IsNullOrEmpty(LogoLink)) return "";
+            return Portal._config.Location + "misc/logos/320/" + LogoLink;
+        }
+
+        public string Genre()
+        {
+            if (Genres != null && Genres.TryGetValue(GenreID, out var genre))
+                return System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(genre);
+            return "Other";
+        }
+    }
+
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            if (args.Length == 0)
+            {
+                Console.WriteLine("Usage: dotnet run <config.yaml>");
+                return;
+            }
+
+            var yamlPath = args[0];
+            if (!File.Exists(yamlPath))
+            {
+                Console.WriteLine($"Config file not found: {yamlPath}");
+                return;
+            }
+
+            var yamlContent = await File.ReadAllTextAsync(yamlPath);
+            var deserializer = new DeserializerBuilder()
+                .WithNamingConvention(UnderscoredNamingConvention.Instance)
+                .Build();
+
+            var config = deserializer.Deserialize<Config>(yamlContent);
+            try
+            {
+                config.Validate();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Config validation failed: {ex.Message}");
+                return;
+            }
+
+            var portal = new Portal(config.Portal);
+            await portal.StartAsync();
+
+            var channels = await portal.RetrieveChannelsAsync();
+
+            Console.WriteLine($"Retrieved {channels.Count} channels:");
+            foreach (var ch in channels.Values)
+            {
+                Console.WriteLine($"- {ch.Title} (Genre: {ch.Genre()})");
+            }
+
+            // Fetch a stream link for first channel as example
+            if (channels.Count > 0)
+            {
+                var firstChannel = channels.Values.GetEnumerator();
+                firstChannel.MoveNext();
+                var link = await firstChannel.Current.NewLinkAsync();
+                Console.WriteLine($"Stream link for '{firstChannel.Current.Title}': {link}");
+            }
+        }
+    }
+}
+
+dotnet add package YamlDotNet
+
+dotnet run config.yaml
+
+Portal.Start()
+  └── Handshake
+  └── [Optional] Authenticate (if username/password present)
+  └── Watchdog Update (loop)
+  ↓
+RetrieveChannels()
+  └── GET /get_all_channels
+      → Returns channel list with:
+          - name
+          - cmd       ← used next
+          - tv_genre_id
+          - logo
+          - cmds[]
+  ↓
+GetGenres()
+  └── GET /get_genres
+      → Map tv_genre_id → genre title
+  ↓
+NewLink(channel)
+  └── cmd = channel.cmd
+  └── GET /create_link?cmd={cmd}
+      → Returns playable URL (e.g. .m3u8)
+
++------------------------+
+|   Portal Start()       |
++------------------------+
+            |
+            v
++------------------------+
+|    Handshake           |
+|  /action=handshake     |
++------------------------+
+            |
+            v
++------------------------------+
+|   [Optional] Authenticate    |
+|  /action=do_auth             |
++------------------------------+
+            |
+            v
++-----------------------------+
+| Watchdog (every 2 min)     |
+| /action=get_events         |
++-----------------------------+
+            |
+            v
++------------------------------+
+| RetrieveChannels()          |
+| /action=get_all_channels    |
++------------------------------+
+            |
+            v
++---------------------------+
+|   getGenres()            |
+|  /action=get_genres      |
++---------------------------+
+            |
+            v
++-------------------------------+
+| User selects channel (e.g. X) |
++-------------------------------+
+            |
+            v
++--------------------------------------------+
+| NewLink(channel.X)                         |
+| /action=create_link?cmd=channel.X.cmd      |
+| → returns playable URL (e.g. m3u8)         |
++--------------------------------------------+
+
+User/App               Stalker Portal API
+   |                          |
+   |------ Handshake -------->|
+   |   /?action=handshake     |
+   |<----- token ok / new ----|
+   |                          |
+   |-- [Optional Auth] ------>|
+   |   /?action=do_auth       |
+   |<--- auth result (js) ----|
+   |                          |
+   |------ Watchdog --------->|
+   |   /?action=get_events    |
+   |<----- OK (noop) ---------|
+   |                          |
+   |-- Retrieve Channels ---->|
+   | /?action=get_all_channels|
+   |<----- JSON list ---------|
+   |                          |
+   |------ Get Genres ------->|
+   |  /?action=get_genres     |
+   |<----- genre map ---------|
+   |                          |
+   |--- Create Link (cmd) --->|
+   | /?action=create_link     |
+   |   &cmd=ffmpeg http...    |
+   |<--- playable URL (m3u8) -|
+
+
+
+from graphviz import Digraph
+
+dot = Digraph(comment='Stalker Portal API Interaction - Sequence Diagram', format='png')
+
+# Define nodes
+dot.node('U', 'User / App', shape='box')
+dot.node('S', 'Stalker Portal API', shape='box')
+
+# Sequence interactions
+edges = [
+    ('U', 'S', 'Handshake\n?action=handshake'),
+    ('S', 'U', 'Token OK / New Token'),
+    ('U', 'S', '[Optional] Authenticate\n?action=do_auth'),
+    ('S', 'U', 'Auth Result (js: true/false)'),
+    ('U', 'S', 'Watchdog\n?action=get_events'),
+    ('S', 'U', 'OK / Noop'),
+    ('U', 'S', 'Get Channels\n?action=get_all_channels'),
+    ('S', 'U', 'List of Channels (JSON)'),
+    ('U', 'S', 'Get Genres\n?action=get_genres'),
+    ('S', 'U', 'Genre Map'),
+    ('U', 'S', 'Create Link\n?action=create_link&cmd=...'),
+    ('S', 'U', 'Playable URL (.m3u8)'),
+    ('U', 'S', 'Retry Auth (if needed)\n?action=do_auth'),
+    ('S', 'U', 'Auth Result (retry)'),
+    ('U', 'S', 'Retry Create Link'),
+    ('S', 'U', 'Playable URL (.m3u8)'),
+]
+
+for src, dst, label in edges:
+    dot.edge(src, dst, label)
+
+# Save diagram to file
+dot.render('stalker_api_sequence_diagram', view=True)
+
+
+pip install graphviz
+
+
+from graphviz import Digraph
+
+dot = Digraph(comment='Stalker Portal API - Two-Step Handshake Flow', format='png')
+
+# Define nodes
+dot.node('U', 'User / App', shape='box')
+dot.node('S', 'Stalker Portal API', shape='box')
+
+# Define edges (sequence steps)
+edges = [
+    ('U', 'S', '1st Handshake (no token)\n?action=handshake&token='),
+    ('S', 'U', '← token + random'),
+    ('U', 'U', '[compute signature/hash from random + device info]'),
+    ('U', 'S', '2nd Handshake with hash\n?action=handshake&token=...&signature=...'),
+    ('S', 'U', '← confirmed token session'),
+    ('U', 'S', '[Optional] Authenticate\n?action=do_auth'),
+    ('S', 'U', '← auth result (js)'),
+    ('U', 'S', 'Watchdog\n?action=get_events'),
+    ('S', 'U', '← OK / noop'),
+    ('U', 'S', 'Get Channels\n?action=get_all_channels'),
+    ('S', 'U', '← channels list'),
+    ('U', 'S', 'Get Genres\n?action=get_genres'),
+    ('S', 'U', '← genre map'),
+    ('U', 'S', 'Create Link\n?action=create_link&cmd=...'),
+    ('S', 'U', '← playable URL (.m3u8)'),
+    ('U', 'S', 'Retry Auth (if needed)\n?action=do_auth'),
+    ('S', 'U', '← retry success'),
+    ('U', 'S', 'Retry Create Link'),
+    ('S', 'U', '← playable URL (.m3u8)'),
+]
+
+# Add edges to diagram
+for src, dst, label in edges:
+    dot.edge(src, dst, label)
+
+# Save to file and open
+dot.render('stalker_two_handshake_sequence', view=True)
+
+
+
+
+
+
+
